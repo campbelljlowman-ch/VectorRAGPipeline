@@ -51,10 +51,10 @@ class S3BatchDownloader:
         skip_existing: bool = True,
         aws_region: Optional[str] = None,
         max_concurrency: int = 10,
-        multipart_threshold_mb: int = 8,   # multipart kicks in above this
+        multipart_threshold_mb: int = 8,
         multipart_chunksize_mb: int = 8,
-        request_payer: Optional[str] = None,  # e.g., "requester" for requester-pays buckets
-        extract_pdf_from_zip: bool = True
+        request_payer: Optional[str] = None,
+        extract_pdf_from_zip: bool = True,
     ):
         self.bucket = bucket
         self.prefix = prefix
@@ -66,8 +66,8 @@ class S3BatchDownloader:
         self.skip_existing = bool(skip_existing)
         self.state_path = Path(state_path) if state_path else None
         self.request_payer = request_payer
+        self.extract_pdf_from_zip = extract_pdf_from_zip
 
-        # S3 client & transfer manager
         if s3_client is None:
             cfg = Config(region_name=aws_region) if aws_region else Config()
             s3_client = boto3.client("s3", config=cfg)
@@ -82,7 +82,6 @@ class S3BatchDownloader:
             ),
         )
 
-        # Pagination state
         self._paginator = self.s3.get_paginator("list_objects_v2")
         self._continuation_token: Optional[str] = None
         self._keys_buffer: List[str] = []
@@ -90,18 +89,15 @@ class S3BatchDownloader:
         self._listed_count = 0
         self._downloaded_count = 0
 
-        # Try to resume
         if self.state_path and self.state_path.exists():
             self._load_state()
-
-    # ---------- Public API ----------
 
     def get_next_chunk(self, max_files: Optional[int] = None) -> List[str]:
         """
         Download the next batch of objects and return local file paths.
+        For .zip objects (when extract_pdf_from_zip=True), returns the extracted
+        PDF path if found, otherwise the .zip path.
         Returns [] when there is nothing left.
-
-        max_files overrides the constructor `chunk_size` if provided.
         """
         if self._exhausted:
             return []
@@ -109,25 +105,39 @@ class S3BatchDownloader:
         target = max(1, max_files or self.chunk_size)
         local_paths: List[str] = []
 
-        # Keep pulling keys into the buffer until we have enough to download or we're exhausted
         while len(self._keys_buffer) < target and not self._exhausted:
             self._refill_keys_buffer()
 
-        # If still empty after refill, we're done
         if not self._keys_buffer:
             self._exhausted = True
             self._save_state()
             return []
 
-        # Pop up to `target` keys and download them
         to_take = min(target, len(self._keys_buffer))
         keys = [self._keys_buffer.pop(0) for _ in range(to_take)]
 
         for key in keys:
             local_path = self._local_path_for_key(key)
+
+            # If we’re extracting PDF from a zip, and the extracted PDF already exists,
+            # we can short-circuit on skip_existing.
+            if (
+                self.extract_pdf_from_zip
+                and key.lower().endswith(".zip")
+            ):
+                preexisting_pdf = self._expected_extracted_pdf_path(local_path)
+                if self.skip_existing and preexisting_pdf and preexisting_pdf.exists():
+                    local_paths.append(str(preexisting_pdf))
+                    continue
+
             if self.skip_existing and local_path.exists():
-                # Skip downloading again; still count as progressed
-                local_paths.append(str(local_path))
+                # We already have the zip/file. If it's a zip and extraction is enabled,
+                # make sure a PDF is extracted/returned.
+                if self.extract_pdf_from_zip and key.lower().endswith(".zip"):
+                    extracted = self._maybe_extract_pdf(local_path)
+                    local_paths.append(str(extracted or local_path))
+                else:
+                    local_paths.append(str(local_path))
                 continue
 
             local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -135,7 +145,6 @@ class S3BatchDownloader:
             if self.request_payer:
                 extra_args["RequestPayer"] = self.request_payer
 
-            # Use the high-level transfer manager (handles retries & multipart)
             self.transfer.download_file(
                 bucket=self.bucket,
                 key=key,
@@ -149,16 +158,13 @@ class S3BatchDownloader:
                     self._downloaded_count += 1
                     local_paths.append(str(extracted))
 
-        # Persist progress occasionally
         self._save_state()
         return local_paths
 
     def done(self) -> bool:
-        """True if the iterator has been exhausted."""
         return self._exhausted
 
     def stats(self) -> dict:
-        """Basic counters for observability."""
         return {
             "listed_keys": self._listed_count,
             "downloaded": self._downloaded_count,
@@ -189,25 +195,19 @@ class S3BatchDownloader:
         if self._exhausted:
             return
 
-        # Build paginator params
         params = {
             "Bucket": self.bucket,
             "Prefix": self.prefix,
-            "PaginationConfig": {
-                "PageSize": self.page_size,
-                # 'MaxItems' is not set so we drive pagination with ContinuationToken
-            },
+            "PaginationConfig": {"PageSize": self.page_size},
         }
         if self._continuation_token:
             params["ContinuationToken"] = self._continuation_token  # type: ignore
 
         page_iter = self._paginator.paginate(**{k: v for k, v in params.items() if v is not None})
 
-        # We only advance one page at a time to keep memory bounded
         try:
             page = next(iter(page_iter))
         except StopIteration:
-            # No more pages
             self._exhausted = True
             return
 
@@ -224,11 +224,8 @@ class S3BatchDownloader:
                 self._exhausted = True
 
     def _local_path_for_key(self, key: str) -> Path:
-        # Preserve key's directory structure under dest_dir
-        safe_key = key.lstrip("/")  # avoid absolute path issues if any
+        return self.dest_dir / key.lstrip("/")
 
-        return self.dest_dir / safe_key
-    
     # ---------- Zip/PDF helpers ----------
 
     def _expected_extracted_pdf_path(self, zip_local_path: Path) -> Optional[Path]:
@@ -316,6 +313,7 @@ class S3BatchDownloader:
             "page_size": self.page_size,
             "skip_existing": self.skip_existing,
             "request_payer": self.request_payer,
+            "extract_pdf_from_zip": self.extract_pdf_from_zip,
         }
         tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
         tmp.write_text(json.dumps(state, indent=2))
@@ -325,8 +323,7 @@ class S3BatchDownloader:
         try:
             data = json.loads(self.state_path.read_text())
         except Exception:
-            return  # ignore corrupt/missing state
-        # Only resume if bucket/prefix/dest_dir match
+            return
         if (
             data.get("bucket") == self.bucket
             and data.get("prefix") == self.prefix
@@ -337,4 +334,3 @@ class S3BatchDownloader:
             self._listed_count = int(data.get("listed_count", 0))
             self._downloaded_count = int(data.get("downloaded_count", 0))
             self._exhausted = bool(data.get("exhausted", False))
-            # keep live settings like chunk/page sizes from __init__

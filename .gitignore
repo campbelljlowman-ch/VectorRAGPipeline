@@ -1,3 +1,4 @@
 data/
 .s3_progress.json
 *.pyc
+.DS_Store
