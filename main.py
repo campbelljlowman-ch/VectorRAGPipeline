@@ -4,6 +4,7 @@ import tiktoken
 import numpy as np
 from openai import OpenAI
 import os
+from sentence_transformers import SentenceTransformer
 
 S3_BUCKET = "pinpointmigration2"
 OPENAI_EMBED_MODEL = "text-embedding-3-small"  # cost-efficient (1536 dims). Use -3-large for higher quality (3072 dims).
@@ -21,13 +22,16 @@ def run_pipeline():
     for pdf_path in pdf_paths:
         vector_embeddings = get_vector_embeddings(pdf_path)
 
+        
+
+
 def get_vector_embeddings(pdf_path):
     full_text = pdf_to_text(pdf_path)
     print(f"PDF Text: {full_text[:100]}...")  # Print first 100 characters for brevity
     chunks = chunk_text_by_tokens(full_text, max_tokens=800, overlap=100)
 
     print(f"Chunked into {len(chunks)} pieces.")
-    vector_embeddings = get_vector_embeddings_of_chunks(chunks)
+    vector_embeddings = get_vector_embeddings_of_chunks_local(chunks)
     print(f"Vector embeddings: {vector_embeddings}")
     return vector_embeddings
 
@@ -52,9 +56,26 @@ def chunk_text_by_tokens(text, max_tokens=800, overlap=100, encoding_name="cl100
         start = end - overlap  # slide with overlap
     return chunks
 
-def get_vector_embeddings_of_chunks(texts):
+def get_vector_embeddings_of_chunks_openai(texts):
     resp = openai_client.embeddings.create(model=OPENAI_EMBED_MODEL, input=texts)
     return np.array([d.embedding for d in resp.data], dtype="float32")
+
+def get_vector_embeddings_of_chunks_local(texts):
+    embedding_model = SentenceTransformer("intfloat/multilingual-e5-large-instruct")
+
+    # sentences = [
+    #     "The weather is lovely today.",
+    #     "It's so sunny outside!",
+    #     "He drove to the stadium."
+    # ]
+    embeddings = embedding_model.encode(texts)
+    print(f"embeddings: {embeddings}")
+    print(f"embeddings shape: {embeddings.shape}")
+    return np.array(embeddings, dtype="float32")
+    # similarities = model.similarity(embeddings, embeddings)
+    # print(similarities.shape)
+    # # [3, 3]
+
 
 if __name__ == "__main__":
     run_pipeline()
