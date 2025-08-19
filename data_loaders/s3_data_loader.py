@@ -156,7 +156,8 @@ class S3BatchDownloader:
                 extracted = self._maybe_extract_pdf(local_path)
                 if extracted:
                     self._downloaded_count += 1
-                    local_paths.append([str(extracted), str(local_path)])
+                    print(f"Extracted PDF from {key} to {extracted}")
+                    local_paths.append([str(extracted), key])
 
         self._save_state()
         return local_paths

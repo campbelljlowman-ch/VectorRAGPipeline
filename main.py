@@ -19,13 +19,15 @@ data_loader = S3BatchDownloader(bucket=S3_BUCKET, dest_dir="data/", prefix=None,
 # OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  
 # openai_client = OpenAI(api_key=OPENAI_API_KEY)  
 
+
+#TODO: Increase chunk size so that most resumes are processed in one go.
+
 def run_pipeline():
     print("Running the Vector RAG Pipeline...")
 
     while not data_loader.done():
-        pdf_paths, s3url = data_loader.get_next_chunk()
         pdfs_pulled = data_loader.get_next_chunk()
-        print(f"Downloaded {pdf_paths} files from S3 bucket '{S3_BUCKET}' to 'data/' directory.")
+        print(f"Downloaded {len(pdfs_pulled)} files from S3 bucket '{S3_BUCKET}' to 'data/' directory.")
 
         for pdf_pulled in pdfs_pulled:
             pdf_path = pdf_pulled[0]
@@ -33,10 +35,10 @@ def run_pipeline():
 
             pdf_chunks = get_pdf_chunks(pdf_path)
             for chunk in pdf_chunks:
-                print(f"Processing chunk: {chunk[:100]}...")  # Print first 100 characters for brevity
+                # print(f"Processing chunk: {chunk[:100]}...")  # Print first 100 characters for brevity
                 vector_embedding = get_vector_embeddings_of_chunks_local([chunk])
-                print(f"Vector embedding shape: {vector_embedding.shape}")
-                print(f"Vector embedding sample: {vector_embedding[:5]}")
+                # print(f"Vector embedding shape: {vector_embedding.shape}")
+                # print(f"Vector embedding sample: {vector_embedding[:5]}")
 
                 postgres_client.execute(
                     "INSERT INTO resumes (content, source, embedding) VALUES (%s, %s, %s)", 
@@ -47,9 +49,9 @@ def run_pipeline():
 
 def get_pdf_chunks(pdf_path):
     full_text = pdf_to_text(pdf_path)
-    print(f"PDF Text: {full_text[:100]}...")  # Print first 100 characters for brevity
+    # print(f"PDF Text: {full_text[:100]}...")  # Print first 100 characters for brevity
     chunks = chunk_text_by_tokens(full_text, max_tokens=800, overlap=100)
-    print(f"Chunked into {len(chunks)} pieces.")
+    # print(f"Chunked into {len(chunks)} pieces.")
     return chunks
 
 # def get_vector_embeddings(pdf_path):
