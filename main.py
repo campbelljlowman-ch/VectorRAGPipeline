@@ -36,7 +36,7 @@ def run_pipeline():
             pdf_chunks = get_pdf_chunks(pdf_path)
             for chunk in pdf_chunks:
                 # print(f"Processing chunk: {chunk[:100]}...")  # Print first 100 characters for brevity
-                vector_embedding = get_vector_embeddings_of_chunks_local([chunk])
+                vector_embedding = get_vector_embeddings_of_chunks_local(chunk)
                 # print(f"Vector embedding shape: {vector_embedding.shape}")
                 # print(f"Vector embedding sample: {vector_embedding[:5]}")
 
@@ -95,9 +95,29 @@ def get_vector_embeddings_of_chunks_local(text):
     embedding = embedding_model.encode(text)
     print(f"embeddings: {embedding}")
     print(f"embedding shape: {embedding.shape}")
-    return embedding[0]
+    return embedding
+
+
+def run_query():
+    while True:
+        query = input("Enter your search query: ")
+
+        query_embedding = get_vector_embeddings_of_chunks_local(query)
+        print(f"Query embedding: {query_embedding}")
+
+        results = postgres_client.execute(
+            "SELECT id, content, source, embedding <=> %s AS cosine_dist FROM resumes ORDER BY embedding <-> %s LIMIT 5",
+            (query_embedding, query_embedding)
+        ).fetchall()
+
+        # print(f"results: {results[0]}")
+        # for result in results:
+        #     print(f"ID: {result[0]}, Content: {result[1][:100]}..., Source: {result[2]}, Distance: {result[3]}")
+        for result in results:
+            print(f"ID: {result[0]}, Content: {result[1][:100]}..., Source: {result[2]}, Distance: {result[3]}")
 
 
 if __name__ == "__main__":
-    run_pipeline()
+    # run_pipeline()
+    run_query()
 
