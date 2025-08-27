@@ -1,123 +1,82 @@
-from data_loaders.s3_data_loader import S3BatchDownloader
-from pypdf import PdfReader
-import tiktoken
-import numpy as np
-from openai import OpenAI
 import os
-from sentence_transformers import SentenceTransformer
-import psycopg
-from pgvector.psycopg import register_vector
+from data_loaders.s3_data_loader import S3BatchDownloader
+from langchain.chat_models import init_chat_model
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_postgres import PGVector
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+
+
+if not os.environ.get("GOOGLE_API_KEY"):
+  raise ValueError("GOOGLE_API_KEY environment variable not set.")
+
+
+llm = init_chat_model("gemini-2.5-flash", model_provider="google_genai")
+embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
+vector_store = PGVector(
+    embeddings=embeddings,
+    collection_name="my_docs",
+    connection="postgresql://postgres:postgres@localhost:5432/hcm",
+)
 
 S3_BUCKET = "pinpointmigration2"
-
-postgres_client = psycopg.connect("postgresql://postgres:postgres@localhost:5432/hcm")
-register_vector(postgres_client)  # enables passing Python lists/np arrays as vector
 data_loader = S3BatchDownloader(bucket=S3_BUCKET, dest_dir="data/", prefix=None, chunk_size=5, state_path=".s3_progress.json")
 
 
-# OPENAI_EMBED_MODEL = "text-embedding-3-small"  # cost-efficient (1536 dims). Use -3-large for higher quality (3072 dims).
-# OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  
-# openai_client = OpenAI(api_key=OPENAI_API_KEY)  
+resumes_processed = 0
+while not data_loader.done() and resumes_processed < 1000:
+    pdfs_pulled = data_loader.get_next_chunk()
+    # print(f"Downloaded {len(pdfs_pulled)} files from S3 bucket '{S3_BUCKET}' to 'data/' directory.")
+
+    for pdf_pulled in pdfs_pulled:
+        pdf_path = pdf_pulled[0]
+        # s3url = pdf_pulled[1]
+
+        loader = PyPDFLoader(pdf_path, mode="single")
+        docs = loader.load()
+
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=2048, chunk_overlap=200)
+        all_splits = text_splitter.split_documents(docs)
+        vector_store.add_documents(documents=all_splits)
+        resumes_processed += 1
+    print(f"Processed {resumes_processed} resumes so far.")
+
+# Define prompt for question-answering
+# N.B. for non-US LangSmith endpoints, you may need to specify
+# api_url="https://api.smith.langchain.com" in hub.pull.
+prompt = hub.pull("rlm/rag-prompt")
 
 
-#TODO: Increase chunk size so that most resumes are processed in one go.
-
-def run_pipeline():
-    print("Running the Vector RAG Pipeline...")
-
-    while not data_loader.done():
-        pdfs_pulled = data_loader.get_next_chunk()
-        print(f"Downloaded {len(pdfs_pulled)} files from S3 bucket '{S3_BUCKET}' to 'data/' directory.")
-
-        for pdf_pulled in pdfs_pulled:
-            pdf_path = pdf_pulled[0]
-            s3url = pdf_pulled[1]
-
-            pdf_chunks = get_pdf_chunks(pdf_path)
-            for chunk in pdf_chunks:
-                # print(f"Processing chunk: {chunk[:100]}...")  # Print first 100 characters for brevity
-                vector_embedding = get_vector_embeddings_of_chunks_local(chunk)
-                # print(f"Vector embedding shape: {vector_embedding.shape}")
-                # print(f"Vector embedding sample: {vector_embedding[:5]}")
-
-                postgres_client.execute(
-                    "INSERT INTO resumes (content, source, embedding) VALUES (%s, %s, %s)", 
-                    (chunk, s3url, vector_embedding)
-                )
-                postgres_client.commit()
+# Define state for application
+class State(TypedDict):
+    question: str
+    context: List[Document]
+    answer: str
 
 
-def get_pdf_chunks(pdf_path):
-    full_text = pdf_to_text(pdf_path)
-    # print(f"PDF Text: {full_text[:100]}...")  # Print first 100 characters for brevity
-    chunks = chunk_text_by_tokens(full_text, max_tokens=800, overlap=100)
-    # print(f"Chunked into {len(chunks)} pieces.")
-    return chunks
-
-# def get_vector_embeddings(pdf_path):
-#     full_text = pdf_to_text(pdf_path)
-#     print(f"PDF Text: {full_text[:100]}...")  # Print first 100 characters for brevity
-#     chunks = chunk_text_by_tokens(full_text, max_tokens=800, overlap=100)
-
-#     print(f"Chunked into {len(chunks)} pieces.")
-#     vector_embeddings = get_vector_embeddings_of_chunks_local(chunks)
-#     print(f"Vector embeddings: {vector_embeddings}")
-#     return vector_embeddings
-
-def pdf_to_text(path):
-    reader = PdfReader(path)
-    pages = []
-    for i, p in enumerate(reader.pages):
-        txt = p.extract_text() or ""
-        pages.append(f"[page {i+1}]\n{txt.strip()}")
-    return "\n\n".join(pages)
-
-def chunk_text_by_tokens(text, max_tokens=800, overlap=100, encoding_name="cl100k_base"):
-    encoding = tiktoken.get_encoding(encoding_name)
-    toks = encoding.encode(text)
-    chunks = []
-    start = 0
-    while start < len(toks):
-        end = min(start + max_tokens, len(toks))
-        chunk = encoding.decode(toks[start:end])
-        chunks.append(chunk)
-        if end == len(toks): break
-        start = end - overlap  # slide with overlap
-    return chunks
-
-# def get_vector_embeddings_of_chunks_openai(texts):
-#     resp = openai_client.embeddings.create(model=OPENAI_EMBED_MODEL, input=texts)
-#     return np.array([d.embedding for d in resp.data], dtype="float32")
-
-def get_vector_embeddings_of_chunks_local(text):
-    embedding_model = SentenceTransformer("intfloat/multilingual-e5-large-instruct")
-
-    embedding = embedding_model.encode(text)
-    print(f"embeddings: {embedding}")
-    print(f"embedding shape: {embedding.shape}")
-    return embedding
+# Define application steps
+def retrieve(state: State):
+    retrieved_docs = vector_store.similarity_search(state["question"])
+    return {"context": retrieved_docs}
 
 
-def run_query():
+def generate(state: State):
+    docs_content = "\n\n".join(doc.page_content for doc in state["context"])
+    messages = prompt.invoke({"question": state["question"], "context": docs_content})
+    response = llm.invoke(messages)
+    return {"answer": response.content}
+
+
+def run_chat():
+    # Compile application and test
+    graph_builder = StateGraph(State).add_sequence([retrieve, generate])
+    graph_builder.add_edge(START, "retrieve")
+    graph = graph_builder.compile()
+
     while True:
-        query = input("Enter your search query: ")
+        print("Running the Chat RAG Pipeline...")
+        question = input("Enter your question: ")
 
-        query_embedding = get_vector_embeddings_of_chunks_local(query)
-        print(f"Query embedding: {query_embedding}")
-
-        results = postgres_client.execute(
-            "SELECT id, content, source, embedding <=> %s AS cosine_dist FROM resumes ORDER BY embedding <-> %s LIMIT 5",
-            (query_embedding, query_embedding)
-        ).fetchall()
-
-        # print(f"results: {results[0]}")
-        # for result in results:
-        #     print(f"ID: {result[0]}, Content: {result[1][:100]}..., Source: {result[2]}, Distance: {result[3]}")
-        for result in results:
-            print(f"ID: {result[0]}, Content: {result[1][:100]}..., Source: {result[2]}, Distance: {result[3]}")
-
-
-if __name__ == "__main__":
-    # run_pipeline()
-    run_query()
-
+        response = graph.invoke({"question": question})
+        print(response["answer"])
