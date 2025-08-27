@@ -26,25 +26,31 @@ vector_store = PGVector(
 )
 
 S3_BUCKET = "pinpointmigration2"
+NUM_OF_RESUMES_TO_PROCESS = 500
 data_loader = S3BatchDownloader(bucket=S3_BUCKET, dest_dir="data/", prefix=None, chunk_size=5, state_path=".s3_progress.json")
 
 
 def run_pipeline():
-    while not data_loader.done():
+    resumes_processed = 0
+    while not data_loader.done() and resumes_processed < NUM_OF_RESUMES_TO_PROCESS:
         pdfs_pulled = data_loader.get_next_chunk()
         # print(f"Downloaded {len(pdfs_pulled)} files from S3 bucket '{S3_BUCKET}' to 'data/' directory.")
 
         for pdf_pulled in pdfs_pulled:
             pdf_path = pdf_pulled[0]
-            # s3url = pdf_pulled[1]
+            s3url = pdf_pulled[1]
+            resume_name = s3url.split("_")[0]
+            # print(f"Processing resume: {resume_name} from {s3url}")
 
             loader = PyPDFLoader(pdf_path, mode="single")
             docs = loader.load()
+            docs[0].metadata.update({"resume_name": resume_name})
 
             text_splitter = RecursiveCharacterTextSplitter(chunk_size=2048, chunk_overlap=200)
             all_splits = text_splitter.split_documents(docs)
             vector_store.add_documents(documents=all_splits)
-            resumes_processed += 1
+
+        resumes_processed = data_loader.get_number_downloaded()
         print(f"Processed {resumes_processed} resumes so far.")
 
 
@@ -53,7 +59,7 @@ def run_pipeline():
 # N.B. for non-US LangSmith endpoints, you may need to specify
 # api_url="https://api.smith.langchain.com" in hub.pull.
 # prompt = hub.pull("rlm/rag-prompt")
-prompt = PromptTemplate.from_template("""You are an assistant for searching a database of resumes. Use the following snippets of resumes to answer the question. If you don't know the answer, just say that you don't know. Be concise but make sure to include the names of all relevant people.
+prompt = PromptTemplate.from_template("""You are an assistant for searching a database of resumes. Use the following snippets of resumes to answer the question. If you don't know the answer, just say that you don't know. Include the resume_name.
 Question: {question} 
 Context: {context} 
 Answer:""")
@@ -68,14 +74,19 @@ class State(TypedDict):
 # Define application steps
 def retrieve(state: State):
     retrieved_docs = vector_store.similarity_search(state["question"], k=20)
+    # for doc in retrieved_docs:
+    #     print(f"Retrieved {doc} documents from vector store.")
     return {"context": retrieved_docs}
 
 
 def generate(state: State):
-    docs_content = "\n\n".join(doc.page_content for doc in state["context"])
+    docs_content = "\n\n".join(f"{doc.page_content}, {doc.metadata}" for doc in state["context"])
+    # docs_content = "\n\n".join(doc.page_content for doc in state["context"])
+    # print(f"context: {docs_content}...")  # Print first 100 characters for brevity
     messages = prompt.invoke({"question": state["question"], "context": docs_content})
     response = llm.invoke(messages)
     return {"answer": response.content}
+    # return {"answer": "response.content"}
 
 
 def run_chat():
